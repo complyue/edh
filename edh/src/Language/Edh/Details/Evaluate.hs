@@ -149,8 +149,10 @@ evalStmt' !stmt !exit = do
             $ evalBlock (deBlock branchesStmt) edhNop
 
       (CallExpr procExpr argsSndr) ->
-        contEdhSTM $ edhMakeCall pgs procExpr argsSndr $ \mkCall ->
-          runEdhProg pgs $ forkEdh exit (mkCall edhNop)
+        evalExpr procExpr $ \(OriginalValue !callee'val _ !callee'that) ->
+          contEdhSTM
+            $ edhMakeCall pgs callee'val callee'that argsSndr
+            $ \mkCall -> runEdhProg pgs $ forkEdh exit (mkCall edhNop)
 
       (ForExpr argsRcvr iterExpr doExpr) ->
         contEdhSTM
@@ -176,8 +178,10 @@ evalStmt' !stmt !exit = do
               $ evalBlock (deBlock branchesStmt) edhNop
 
         (CallExpr procExpr argsSndr) ->
-          contEdhSTM $ edhMakeCall pgs procExpr argsSndr $ \mkCall ->
-            schedDefered pgs (mkCall edhNop)
+          evalExpr procExpr $ \(OriginalValue callee'val _ callee'that) ->
+            contEdhSTM
+              $ edhMakeCall pgs callee'val callee'that argsSndr
+              $ \mkCall -> schedDefered pgs (mkCall edhNop)
 
         (ForExpr argsRcvr iterExpr doExpr) ->
           contEdhSTM
@@ -563,7 +567,9 @@ evalExpr expr exit = do
       (StmtSrc (!srcPos, _)) = contextStmt ctx
       !scope                 = contextScope ctx
   case expr of
-    LitExpr lit -> case lit of
+    GodSendExpr !val -> exitEdhProc exit val
+
+    LitExpr     lit  -> case lit of
       DecLiteral    v -> exitEdhProc exit (EdhDecimal v)
       StringLiteral v -> exitEdhProc exit (EdhString v)
       BoolLiteral   v -> exitEdhProc exit (EdhBool v)
@@ -705,6 +711,7 @@ evalExpr expr exit = do
     AttrExpr addr -> case addr of
       ThisRef          -> exitEdhProc exit (EdhObject $ thisObject scope)
       ThatRef          -> exitEdhProc exit (EdhObject $ thatObject scope)
+      SuperRef -> throwEdh EvalError "Can not address a single super alone"
       DirectRef !addr' -> contEdhSTM $ do
         !key <- resolveAddr pgs addr'
         resolveEdhCtxAttr scope key >>= \case
@@ -713,23 +720,46 @@ evalExpr expr exit = do
           Just !originVal -> exitEdhSTM' pgs exit originVal
       IndirectRef !tgtExpr !addr' -> contEdhSTM $ do
         key <- resolveAddr pgs addr'
-        runEdhProg pgs $ evalExpr tgtExpr $ \(OriginalValue !tgtVal _ _) ->
-          case tgtVal of
-            (EdhObject !obj) ->
-              contEdhSTM $ resolveEdhObjAttr obj key >>= \case
-                Nothing ->
-                  throwEdhSTM pgs EvalError
-                    $  "No such attribute "
-                    <> T.pack (show key)
-                    <> " from "
-                    <> T.pack (show obj)
-                Just !originVal -> exitEdhSTM' pgs exit originVal
-            _ ->
-              throwEdh EvalError
-                $  "Expecting an object but got a "
-                <> T.pack (show $ edhTypeOf tgtVal)
-                <> ": "
-                <> T.pack (show tgtVal)
+        case tgtExpr of
+          -- give super objects the magical power to intercept
+          -- attribute access on descendant objects, via `this` ref
+          AttrExpr ThisRef ->
+            let !this = thisObject scope
+            in  runEdhProg pgs
+                  $ getEdhMagicAttr (AttrByName "@<-") this key exit
+          AttrExpr ThatRef -> -- no magic layer laid over that access
+            let !that = thatObject scope
+            in  resolveEdhObjAttr that key >>= \case
+                  Nothing ->
+                    throwEdhSTM pgs EvalError
+                      $  "No such attribute "
+                      <> T.pack (show key)
+                      <> " from that "
+                      <> T.pack (show that)
+                  Just !originVal -> exitEdhSTM' pgs exit originVal
+          AttrExpr SuperRef -> -- no magic layer laid over super access
+            let !this = thisObject scope
+            in  resolveEdhSuperAttr this key >>= \case
+                  Nothing ->
+                    throwEdhSTM pgs EvalError
+                      $  "No such attribute "
+                      <> T.pack (show key)
+                      <> " from super(s) of "
+                      <> T.pack (show this)
+                  Just !originVal -> exitEdhSTM' pgs exit originVal
+          _ ->
+            runEdhProg pgs $ evalExpr tgtExpr $ \(OriginalValue !tgtVal _ _) ->
+              case tgtVal of
+                (EdhObject !obj) ->
+                  -- give super objects the magical power to intercept
+                  -- attribute access on descendant objects, via object ref
+                  getEdhMagicAttr (AttrByName "@<-*") obj key exit
+                _ ->
+                  throwEdh EvalError
+                    $  "Expecting an object but got a "
+                    <> T.pack (show $ edhTypeOf tgtVal)
+                    <> ": "
+                    <> T.pack (show tgtVal)
 
 
     IndexExpr ixExpr tgtExpr ->
@@ -790,8 +820,10 @@ evalExpr expr exit = do
 
 
     CallExpr procExpr argsSndr ->
-      contEdhSTM $ edhMakeCall pgs procExpr argsSndr $ \mkCall ->
-        runEdhProg pgs (mkCall exit)
+      evalExpr procExpr $ \(OriginalValue callee'val _ callee'that) ->
+        contEdhSTM
+          $ edhMakeCall pgs callee'val callee'that argsSndr
+          $ \mkCall -> runEdhProg pgs (mkCall exit)
 
 
     InfixExpr !opSym !lhExpr !rhExpr ->
@@ -934,94 +966,117 @@ validateOperDecl !pgs (ProcDecl _ !op'args _) = case op'args of
   _ -> throwEdhSTM pgs EvalError "Invalid operator signature"
 
 
+getEdhMagicAttr
+  :: AttrKey -> Object -> AttrKey -> EdhProcExit -> EdhProg (STM ())
+getEdhMagicAttr !magicAddr !this !addr !exit = do
+  !pgs <- ask
+  contEdhSTM $ lookupEdhSuperAttr this magicAddr >>= \case
+    Just !magicMth -> -- call magic method for the attribute
+      -- TODO validate magic method signature, show more friendly error
+      edhMakeCall pgs
+                  magicMth
+                  this
+                  [SendPosArg (GodSendExpr $ attrKeyValue addr)]
+        $ \mkCall -> runEdhProg pgs (mkCall exit)
+
+    Nothing -> -- no magic method for attr access
+               resolveEdhObjAttr this addr >>= \case
+      Nothing ->
+        throwEdhSTM pgs EvalError
+          $  "No such attribute "
+          <> T.pack (show addr)
+          <> " from "
+          <> T.pack (show this)
+      Just !originVal -> exitEdhSTM' pgs exit originVal
+
+
 edhMakeCall
   :: EdhProgState
-  -> Expr
+  -> EdhValue
+  -> Object
   -> ArgsSender
   -> ((EdhProcExit -> EdhProg (STM ())) -> STM ())
   -> STM ()
-edhMakeCall !pgsCaller !procExpr !argsSndr !callMaker = do
+edhMakeCall !pgsCaller !callee'val !callee'that !argsSndr !callMaker = do
   let !callerCtx   = edh'context pgsCaller
       !callerScope = contextScope callerCtx
-  runEdhProg pgsCaller
-    $ evalExpr procExpr
-    $ \(OriginalValue !callee'val !_callee'scope !callee'that) ->
-        case callee'val of
+  case callee'val of
 
-          -- calling a host procedure
-          (EdhHostProc (HostProcedure proc'name proc)) -> contEdhSTM $ do
-            procDecl <- hostProcDecl proc'name
-            callMaker $ \exit -> do
-            -- a host procedure runs against its caller's scope, with
-            -- 'thatObject' changed to the resolution target object
-              let
-                !calleeScope =
-                  callerScope { thatObject = callee'that, scopeProc = procDecl }
-                !calleeCtx = callerCtx
-                  { callStack       = calleeScope <| callStack callerCtx
-                  , generatorCaller = Nothing
-                  , contextMatch    = true
-                  , contextStmt     = voidStatement
-                  }
-                !pgsCallee = pgsCaller { edh'context = calleeCtx }
-              contEdhSTM
-                -- insert a cycle tick here, so if no tx required for the call
-                -- overall, the callee resolution tx stops here then the callee
-                -- runs in next stm transaction
-                $ flip (exitEdhSTM' pgsCallee) (wuji pgsCallee)
-                $ \_ -> proc argsSndr $ \OriginalValue {..} ->
-                    -- return the result in CPS with caller pgs restored
-                    contEdhSTM $ exitEdhSTM pgsCaller exit valueFromOrigin
+    -- calling a host procedure
+    (EdhHostProc (HostProcedure proc'name proc)) -> do
+      procDecl <- hostProcDecl proc'name
+      callMaker $ \exit -> do
+      -- a host procedure runs against its caller's scope, with
+      -- 'thatObject' changed to the resolution target object
+        let !calleeScope =
+              callerScope { thatObject = callee'that, scopeProc = procDecl }
+            !calleeCtx = callerCtx
+              { callStack       = calleeScope <| callStack callerCtx
+              , generatorCaller = Nothing
+              , contextMatch    = true
+              , contextStmt     = voidStatement
+              }
+            !pgsCallee = pgsCaller { edh'context = calleeCtx }
+        contEdhSTM
+          -- insert a cycle tick here, so if no tx required for the call
+          -- overall, the callee resolution tx stops here then the callee
+          -- runs in next stm transaction
+          $ flip (exitEdhSTM' pgsCallee) (wuji pgsCallee)
+          $ \_ -> proc argsSndr $ \OriginalValue {..} ->
+              -- return the result in CPS with caller pgs restored
+              contEdhSTM $ exitEdhSTM pgsCaller exit valueFromOrigin
 
-          -- calling a class (constructor) procedure
-          (EdhClass cls) ->
-              -- ensure atomicity of args sending
-            local (const pgsCaller { edh'in'tx = True })
-              $ packEdhArgs argsSndr
-              $ \apk -> contEdhSTM $ callMaker $ constructEdhObject apk cls
+    -- calling a class (constructor) procedure
+    (EdhClass cls) ->
+      -- ensure atomicity of args sending
+      runEdhProg pgsCaller { edh'in'tx = True }
+        $ packEdhArgs argsSndr
+        $ \apk -> contEdhSTM $ callMaker $ constructEdhObject apk cls
 
-          -- calling a method procedure
-          (EdhMethod (Method !mth'lexi'stack !mth'proc)) ->
-            -- ensure atomicity of args sending
-            local (const pgsCaller { edh'in'tx = True })
-              $ packEdhArgs argsSndr
-              $ \apk -> contEdhSTM $ callMaker $ callEdhMethod apk
-                                                               callee'that
-                                                               mth'lexi'stack
-                                                               mth'proc
-                                                               Nothing
+    -- calling a method procedure
+    (EdhMethod (Method !mth'lexi'stack !mth'proc)) ->
+      -- ensure atomicity of args sending
+      runEdhProg pgsCaller { edh'in'tx = True }
+        $ packEdhArgs argsSndr
+        $ \apk -> contEdhSTM $ callMaker $ callEdhMethod apk
+                                                         callee'that
+                                                         mth'lexi'stack
+                                                         mth'proc
+                                                         Nothing
 
-          -- calling an interpreter procedure
-          (EdhInterpreter (Interpreter !mth'lexi'stack !mth'proc)) ->
-            -- ensure atomicity of args sending
-            local (const pgsCaller { edh'in'tx = True })
-              $ packEdhExprs argsSndr
-              $ \(ArgsPack !args !kwargs) -> contEdhSTM $ do
-                  argCallerScope <- mkScopeWrapper (contextWorld callerCtx)
-                                                   (contextScope callerCtx)
-                  callMaker $ callEdhMethod
-                    (ArgsPack (EdhObject argCallerScope : args) kwargs)
-                    callee'that
-                    mth'lexi'stack
-                    mth'proc
-                    Nothing
+    -- calling an interpreter procedure
+    (EdhInterpreter (Interpreter !mth'lexi'stack !mth'proc)) ->
+      -- ensure atomicity of args sending
+      runEdhProg pgsCaller { edh'in'tx = True }
+        $ packEdhExprs argsSndr
+        $ \(ArgsPack !args !kwargs) -> contEdhSTM $ do
+            argCallerScope <- mkScopeWrapper (contextWorld callerCtx)
+                                             (contextScope callerCtx)
+            callMaker $ callEdhMethod
+              (ArgsPack (EdhObject argCallerScope : args) kwargs)
+              callee'that
+              mth'lexi'stack
+              mth'proc
+              Nothing
 
-          -- calling a host generator
-          (EdhHostGenr _) ->
-            throwEdh EvalError "Can only call a host generator by for-from-do"
+    -- calling a host generator
+    (EdhHostGenr _) -> throwEdhSTM
+      pgsCaller
+      EvalError
+      "Can only call a host generator by for-from-do"
 
-          -- calling a generator
-          (EdhGenrDef _) ->
-            throwEdh EvalError "Can only call a generator method by for-from-do"
+    -- calling a generator
+    (EdhGenrDef _) -> throwEdhSTM
+      pgsCaller
+      EvalError
+      "Can only call a generator method by for-from-do"
 
-          _ ->
-            throwEdh EvalError
-              $  "Can not call a "
-              <> T.pack (show $ edhTypeOf callee'val)
-              <> ": "
-              <> T.pack (show callee'val)
-              <> " ❌ expressed with: "
-              <> T.pack (show procExpr)
+    _ ->
+      throwEdhSTM pgsCaller EvalError
+        $  "Can not call a "
+        <> T.pack (show $ edhTypeOf callee'val)
+        <> ": "
+        <> T.pack (show callee'val)
 
 
 constructEdhObject :: ArgsPack -> Class -> EdhProcExit -> EdhProg (STM ())
@@ -1388,6 +1443,7 @@ assignEdhTarget !pgsAfter !lhExpr !exit !rhVal = do
           finishAssign (objEntity this) key
         AttrExpr ThatRef -> contEdhSTM $ resolveAddr pgs addr' >>= \key ->
           finishAssign (objEntity that) key
+        AttrExpr SuperRef -> throwEdh EvalError "Can not assign via super"
         _ -> evalExpr tgtExpr $ \OriginalValue {..} -> case valueFromOrigin of
           EdhObject !tgtObj -> contEdhSTM $ resolveAddr pgs addr' >>= \key ->
             finishAssign (objEntity tgtObj) key
@@ -1397,8 +1453,9 @@ assignEdhTarget !pgsAfter !lhExpr !exit !rhVal = do
               <> T.pack (show $ edhTypeOf valueFromOrigin)
               <> ": "
               <> T.pack (show valueFromOrigin)
-      ThisRef -> throwEdh EvalError "Can not assign to this"
-      ThatRef -> throwEdh EvalError "Can not assign to that"
+      ThisRef  -> throwEdh EvalError "Can not assign to this"
+      ThatRef  -> throwEdh EvalError "Can not assign to that"
+      SuperRef -> throwEdh EvalError "Can not assign to super"
     x ->
       throwEdh EvalError $ "Invalid left hand value for assignment: " <> T.pack
         (show x)
