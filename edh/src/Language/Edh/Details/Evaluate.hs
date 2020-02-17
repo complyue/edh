@@ -725,9 +725,19 @@ evalExpr expr exit = do
           -- attribute access on descendant objects, via `this` ref
           AttrExpr ThisRef ->
             let !this = thisObject scope
-            in  runEdhProg pgs
-                  $ getEdhMagicAttr (AttrByName "@<-") this key exit
-          AttrExpr ThatRef -> -- no magic layer laid over that access
+            in  runEdhProg pgs $ getEdhAttrWithMagic
+                  (AttrByName "@<-")
+                  this
+                  key
+                  (  throwEdh EvalError
+                  $  "No such attribute "
+                  <> T.pack (show key)
+                  <> " from "
+                  <> T.pack (show this)
+                  )
+                  exit
+          -- no magic layer laid over access via `that` ref
+          AttrExpr ThatRef ->
             let !that = thatObject scope
             in  resolveEdhObjAttr that key >>= \case
                   Nothing ->
@@ -737,23 +747,39 @@ evalExpr expr exit = do
                       <> " from that "
                       <> T.pack (show that)
                   Just !originVal -> exitEdhSTM' pgs exit originVal
-          AttrExpr SuperRef -> -- no magic layer laid over super access
+          -- give super objects of any super object the magical power to intercept
+          -- attribute access on super object, via `super` ref
+          AttrExpr SuperRef ->
             let !this = thisObject scope
-            in  resolveEdhSuperAttr this key >>= \case
-                  Nothing ->
-                    throwEdhSTM pgs EvalError
+                getFromSupers :: [Object] -> EdhProg (STM ())
+                getFromSupers [] =
+                    throwEdh EvalError
                       $  "No such attribute "
                       <> T.pack (show key)
                       <> " from super(s) of "
                       <> T.pack (show this)
-                  Just !originVal -> exitEdhSTM' pgs exit originVal
+                getFromSupers (super : restSupers) = getEdhAttrWithMagic
+                  (AttrByName "@<-^")
+                  super
+                  key
+                  (getFromSupers restSupers)
+                  exit
+            in  readTVar (objSupers this) >>= runEdhProg pgs . getFromSupers
+          -- give super objects the magical power to intercept
+          -- attribute access on descendant objects, via obj ref
           _ ->
             runEdhProg pgs $ evalExpr tgtExpr $ \(OriginalValue !tgtVal _ _) ->
               case tgtVal of
-                (EdhObject !obj) ->
-                  -- give super objects the magical power to intercept
-                  -- attribute access on descendant objects, via object ref
-                  getEdhMagicAttr (AttrByName "@<-*") obj key exit
+                (EdhObject !obj) -> getEdhObjAttr
+                  obj
+                  key
+                  (  throwEdh EvalError
+                  $  "No such attribute "
+                  <> T.pack (show key)
+                  <> " from "
+                  <> T.pack (show obj)
+                  )
+                  exit
                 _ ->
                   throwEdh EvalError
                     $  "Expecting an object but got a "
@@ -966,28 +992,55 @@ validateOperDecl !pgs (ProcDecl _ !op'args _) = case op'args of
   _ -> throwEdhSTM pgs EvalError "Invalid operator signature"
 
 
-getEdhMagicAttr
-  :: AttrKey -> Object -> AttrKey -> EdhProcExit -> EdhProg (STM ())
-getEdhMagicAttr !magicAddr !this !addr !exit = do
-  !pgs <- ask
-  contEdhSTM $ lookupEdhSuperAttr this magicAddr >>= \case
-    Just !magicMth -> -- call magic method for the attribute
-      -- TODO validate magic method signature, show more friendly error
-      edhMakeCall pgs
-                  magicMth
-                  this
-                  [SendPosArg (GodSendExpr $ attrKeyValue addr)]
-        $ \mkCall -> runEdhProg pgs (mkCall exit)
+-- note: this handles `obj.attr` only; `this.attr` and `super.attr` are handled
+--       differently, and `that.attr` imposes no magic at all, see `evalExpr`
+getEdhObjAttr
+  :: Object -> AttrKey -> EdhProg (STM ()) -> EdhProcExit -> EdhProg (STM ())
+getEdhObjAttr !obj !key !exitWithout !exit =
+  getEdhAttrWithMagic (AttrByName "@<-*") obj key exitWithout exit
 
-    Nothing -> -- no magic method for attr access
-               resolveEdhObjAttr this addr >>= \case
-      Nothing ->
-        throwEdhSTM pgs EvalError
-          $  "No such attribute "
-          <> T.pack (show addr)
-          <> " from "
-          <> T.pack (show this)
+-- | There're 2 tiers of magic happen during object attribute resolution in Edh.
+--  *) a magical super controls its direct descendants in behaving as an object, by
+--     intercepting the attr lookup
+--  *) a metamagical super controls its direct descendants in behaving as a magical
+--     super, by intercepting the magic method (as attr) lookup
+getEdhAttrWithMagic
+  :: AttrKey
+  -> Object
+  -> AttrKey
+  -> EdhProg (STM ())
+  -> EdhProcExit
+  -> EdhProg (STM ())
+getEdhAttrWithMagic !magicKey !this !key !exitWithout !exit = do
+  !pgs <- ask
+  contEdhSTM $ readTVar (objSupers this) >>= runEdhProg pgs . getFromSupers
+ where
+  getFromSupers :: [Object] -> EdhProg (STM ())
+  getFromSupers [] = do
+    !pgs <- ask
+    contEdhSTM $ resolveEdhObjAttr this key >>= \case
+      Nothing         -> runEdhProg pgs exitWithout
       Just !originVal -> exitEdhSTM' pgs exit originVal
+  getFromSupers (super : restSupers) = do
+    !pgs <- ask
+    getEdhAttrWithMagic (AttrByName "<-#")
+                        super
+                        magicKey
+                        (getFromSupers restSupers)
+      $ \(OriginalValue !magicMth _ _) ->
+          contEdhSTM
+            $ edhMakeCall pgs
+                          magicMth
+                          this
+                          [SendPosArg (GodSendExpr $ attrKeyValue key)]
+            $ \mkCall ->
+                runEdhProg pgs
+                  $ mkCall
+                  $ \magicResult@(OriginalValue !magicRtn _ _) ->
+                      case magicRtn of
+                        EdhContinue -> getFromSupers restSupers
+                        _           -> exit magicResult
+
 
 
 edhMakeCall

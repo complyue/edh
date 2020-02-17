@@ -1,0 +1,59 @@
+
+{
+
+  class HyperMan1 * {
+
+    method (<-#) (magicSpell) {
+      30 <| 'invoking spell (' ++ magicSpell ++ ')'
+
+      # treat nil as not present
+      that?$magicSpell |> continue
+    }
+
+  }
+
+  class Man1 * {
+
+    method (@<-) (attrName) {
+      20 <| 'getting this.' ++ attrName
+      continue  # will fail if no such attr
+    }
+
+    method (@<-*) (attrName) {
+      20 <| 'getting ' ++ attrName ++ ' from the obj'
+      that?$attrName  # giving out nil if no such attr
+    }
+
+    extends HyperMan1()
+
+  }
+
+  class BusObj1 * {
+
+    method n () {
+      this.n1
+    }
+
+    this.n1 = 7
+
+    this.n2 = 3
+
+    extends Man1()
+
+  }
+
+}
+
+bo1 = BusObj1()
+
+{
+
+  10<| 'bo1.n() is ' ++ bo1.n() 
+
+  10<| 'bo1.n1 is ' ++ bo1.n1
+
+  10<| 'bo1.n2 is ' ++ bo1.n2
+
+  10<| 'bo1.n3 is ' ++ bo1.n3
+
+}
