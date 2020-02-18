@@ -720,72 +720,16 @@ evalExpr expr exit = do
           Just !originVal -> exitEdhSTM' pgs exit originVal
       IndirectRef !tgtExpr !addr' -> contEdhSTM $ do
         key <- resolveAddr pgs addr'
-        case tgtExpr of
-          -- give super objects the magical power to intercept
-          -- attribute access on descendant objects, via `this` ref
-          AttrExpr ThisRef ->
-            let !this = thisObject scope
-            in  runEdhProg pgs $ getEdhAttrWithMagic
-                  (AttrByName "@<-")
-                  this
-                  key
-                  (  throwEdh EvalError
-                  $  "No such attribute "
-                  <> T.pack (show key)
-                  <> " from "
-                  <> T.pack (show this)
-                  )
-                  exit
-          -- no magic layer laid over access via `that` ref
-          AttrExpr ThatRef ->
-            let !that = thatObject scope
-            in  resolveEdhObjAttr that key >>= \case
-                  Nothing ->
-                    throwEdhSTM pgs EvalError
-                      $  "No such attribute "
-                      <> T.pack (show key)
-                      <> " from that "
-                      <> T.pack (show that)
-                  Just !originVal -> exitEdhSTM' pgs exit originVal
-          -- give super objects of any super object the magical power to intercept
-          -- attribute access on super object, via `super` ref
-          AttrExpr SuperRef ->
-            let !this = thisObject scope
-                getFromSupers :: [Object] -> EdhProg (STM ())
-                getFromSupers [] =
-                    throwEdh EvalError
-                      $  "No such attribute "
-                      <> T.pack (show key)
-                      <> " from super(s) of "
-                      <> T.pack (show this)
-                getFromSupers (super : restSupers) = getEdhAttrWithMagic
-                  (AttrByName "@<-^")
-                  super
-                  key
-                  (getFromSupers restSupers)
-                  exit
-            in  readTVar (objSupers this) >>= runEdhProg pgs . getFromSupers
-          -- give super objects the magical power to intercept
-          -- attribute access on descendant objects, via obj ref
-          _ ->
-            runEdhProg pgs $ evalExpr tgtExpr $ \(OriginalValue !tgtVal _ _) ->
-              case tgtVal of
-                (EdhObject !obj) -> getEdhObjAttr
-                  obj
-                  key
-                  (  throwEdh EvalError
-                  $  "No such attribute "
-                  <> T.pack (show key)
-                  <> " from "
-                  <> T.pack (show obj)
-                  )
-                  exit
-                _ ->
-                  throwEdh EvalError
-                    $  "Expecting an object but got a "
-                    <> T.pack (show $ edhTypeOf tgtVal)
-                    <> ": "
-                    <> T.pack (show tgtVal)
+        runEdhProg pgs $ getEdhAttr
+          tgtExpr
+          key
+          (  throwEdh EvalError
+          $  "No such attribute "
+          <> T.pack (show key)
+          <> " from "
+          <> T.pack (show tgtExpr)
+          )
+          exit
 
 
     IndexExpr ixExpr tgtExpr ->
@@ -992,18 +936,70 @@ validateOperDecl !pgs (ProcDecl _ !op'args _) = case op'args of
   _ -> throwEdhSTM pgs EvalError "Invalid operator signature"
 
 
--- note: this handles `obj.attr` only; `this.attr` and `super.attr` are handled
---       differently, and `that.attr` imposes no magic at all, see `evalExpr`
-getEdhObjAttr
-  :: Object -> AttrKey -> EdhProg (STM ()) -> EdhProcExit -> EdhProg (STM ())
-getEdhObjAttr !obj !key !exitWithout !exit =
-  getEdhAttrWithMagic (AttrByName "@<-*") obj key exitWithout exit
+getEdhAttr
+  :: Expr -> AttrKey -> EdhProg (STM ()) -> EdhProcExit -> EdhProg (STM ())
+getEdhAttr !fromExpr !key !exitNoAttr !exit = do
+  !pgs <- ask
+  let scope = contextScope $ edh'context pgs
+  case fromExpr of
+    -- give super objects the magical power to intercept
+    -- attribute access on descendant objects, via `this` ref
+    AttrExpr ThisRef ->
+      let !this = thisObject scope
+          noMagic :: EdhProg (STM ())
+          noMagic = contEdhSTM $ resolveEdhObjAttr this key >>= \case
+            Nothing         -> runEdhProg pgs exitNoAttr
+            Just !originVal -> exitEdhSTM' pgs exit originVal
+      in  getEdhAttrWithMagic (AttrByName "@<-") this key noMagic exit
+    -- no magic layer laid over access via `that` ref
+    AttrExpr ThatRef ->
+      let !that = thatObject scope
+      in  contEdhSTM $ resolveEdhObjAttr that key >>= \case
+            Nothing         -> runEdhProg pgs exitNoAttr
+            Just !originVal -> exitEdhSTM' pgs exit originVal
+    -- give super objects of an super object the metamagical power to
+    -- intercept attribute access on super object, via `super` ref
+    AttrExpr SuperRef ->
+      let !this = thisObject scope
+          noMagic :: EdhProg (STM ())
+          noMagic = contEdhSTM $ resolveEdhSuperAttr this key >>= \case
+            Nothing         -> runEdhProg pgs exitNoAttr
+            Just !originVal -> exitEdhSTM' pgs exit originVal
+          getFromSupers :: [Object] -> EdhProg (STM ())
+          getFromSupers []                   = noMagic
+          getFromSupers (super : restSupers) = getEdhAttrWithMagic
+            (AttrByName "@<-^")
+            super
+            key
+            (getFromSupers restSupers)
+            exit
+      in  contEdhSTM
+            $   readTVar (objSupers this)
+            >>= runEdhProg pgs
+            .   getFromSupers
+    -- give super objects the magical power to intercept
+    -- attribute access on descendant objects, via obj ref
+    _ -> evalExpr fromExpr $ \(OriginalValue !fromVal _ _) -> case fromVal of
+      (EdhObject !obj) -> do
+        let noMagic :: EdhProg (STM ())
+            noMagic = contEdhSTM $ resolveEdhObjAttr obj key >>= \case
+              Nothing         -> runEdhProg pgs exitNoAttr
+              Just !originVal -> exitEdhSTM' pgs exit originVal
+        getEdhAttrWithMagic (AttrByName "@<-*") obj key noMagic exit
+      _ ->
+        throwEdh EvalError
+          $  "Expecting an object but got a "
+          <> T.pack (show $ edhTypeOf fromVal)
+          <> ": "
+          <> T.pack (show fromVal)
 
--- | There're 2 tiers of magic happen during object attribute resolution in Edh.
+
+-- There're 2 tiers of magic happen during object attribute resolution in Edh.
 --  *) a magical super controls its direct descendants in behaving as an object, by
---     intercepting the attr lookup
+--     intercepting the attr resolution
 --  *) a metamagical super controls its direct descendants in behaving as a magical
---     super, by intercepting the magic method (as attr) lookup
+--     super, by intercepting the magic method (as attr) resolution
+
 getEdhAttrWithMagic
   :: AttrKey
   -> Object
@@ -1011,36 +1007,121 @@ getEdhAttrWithMagic
   -> EdhProg (STM ())
   -> EdhProcExit
   -> EdhProg (STM ())
-getEdhAttrWithMagic !magicKey !this !key !exitWithout !exit = do
+getEdhAttrWithMagic !magicKey !obj !key !exitNoMagic !exit = do
   !pgs <- ask
-  contEdhSTM $ readTVar (objSupers this) >>= runEdhProg pgs . getFromSupers
+  contEdhSTM $ readTVar (objSupers obj) >>= runEdhProg pgs . getViaSupers
  where
-  getFromSupers :: [Object] -> EdhProg (STM ())
-  getFromSupers [] = do
+  getViaSupers :: [Object] -> EdhProg (STM ())
+  getViaSupers []                   = exitNoMagic
+  getViaSupers (super : restSupers) = do
     !pgs <- ask
-    contEdhSTM $ resolveEdhObjAttr this key >>= \case
-      Nothing         -> runEdhProg pgs exitWithout
-      Just !originVal -> exitEdhSTM' pgs exit originVal
-  getFromSupers (super : restSupers) = do
-    !pgs <- ask
-    getEdhAttrWithMagic (AttrByName "<-#")
+    getEdhAttrWithMagic (AttrByName "!<-")
                         super
                         magicKey
-                        (getFromSupers restSupers)
+                        (getViaSupers restSupers)
       $ \(OriginalValue !magicMth _ _) ->
           contEdhSTM
             $ edhMakeCall pgs
                           magicMth
-                          this
+                          obj
                           [SendPosArg (GodSendExpr $ attrKeyValue key)]
             $ \mkCall ->
                 runEdhProg pgs
                   $ mkCall
                   $ \magicResult@(OriginalValue !magicRtn _ _) ->
                       case magicRtn of
-                        EdhContinue -> getFromSupers restSupers
+                        EdhContinue -> getViaSupers restSupers
                         _           -> exit magicResult
 
+setEdhAttrWithMagic
+  :: EdhProgState
+  -> AttrKey
+  -> Object
+  -> AttrKey
+  -> EdhValue
+  -> EdhProg (STM ())
+  -> EdhProcExit
+  -> EdhProg (STM ())
+setEdhAttrWithMagic !pgsAfter !magicKey !obj !key !val !exitNoMagic !exit = do
+  !pgs <- ask
+  contEdhSTM $ readTVar (objSupers obj) >>= runEdhProg pgs . setViaSupers
+ where
+  setViaSupers :: [Object] -> EdhProg (STM ())
+  setViaSupers []                   = exitNoMagic
+  setViaSupers (super : restSupers) = do
+    !pgs <- ask
+    getEdhAttrWithMagic (AttrByName "!<-")
+                        super
+                        magicKey
+                        (setViaSupers restSupers)
+      $ \(OriginalValue !magicMth _ _) ->
+          contEdhSTM
+            $ edhMakeCall
+                pgs
+                magicMth
+                obj
+                [ SendPosArg (GodSendExpr $ attrKeyValue key)
+                , SendPosArg (GodSendExpr val)
+                ]
+            $ \mkCall ->
+                runEdhProg pgs $ mkCall $ \(OriginalValue !magicRtn _ _) ->
+                  case magicRtn of
+                    EdhContinue -> setViaSupers restSupers
+                    _ -> local (const pgsAfter) $ exitEdhProc exit magicRtn
+
+
+setEdhAttr
+  :: EdhProgState
+  -> Expr
+  -> AttrKey
+  -> EdhValue
+  -> EdhProcExit
+  -> EdhProg (STM ())
+setEdhAttr !pgsAfter !tgtExpr !key !val !exit = do
+  !pgs <- ask
+  let !(Scope _ !this !that _ _) = contextScope $ edh'context pgs
+  case tgtExpr of
+    -- give super objects the magical power to intercept
+    -- attribute assignment to descendant objects, via `this` ref
+    AttrExpr ThisRef ->
+      let noMagic :: EdhProg (STM ())
+          noMagic = contEdhSTM $ do
+            modifyTVar' (objEntity this) $ Map.insert key val
+            runEdhProg pgsAfter $ exitEdhProc exit val
+      in  setEdhAttrWithMagic pgsAfter
+                              (AttrByName "<-@")
+                              this
+                              key
+                              val
+                              noMagic
+                              exit
+    -- no magic layer laid over assignment via `that` ref
+    AttrExpr ThatRef -> contEdhSTM $ do
+      modifyTVar' (objEntity that) $ Map.insert key val
+      runEdhProg pgsAfter $ exitEdhProc exit val
+    -- not allowing assignment via super
+    AttrExpr SuperRef -> throwEdh EvalError "Can not assign via super"
+    -- give super objects the magical power to intercept
+    -- attribute assignment to descendant objects, via obj ref
+    _ -> evalExpr tgtExpr $ \(OriginalValue !tgtVal _ _) -> case tgtVal of
+      EdhObject !tgtObj ->
+        let noMagic :: EdhProg (STM ())
+            noMagic = contEdhSTM $ do
+              modifyTVar' (objEntity tgtObj) $ Map.insert key val
+              runEdhProg pgsAfter $ exitEdhProc exit val
+        in  setEdhAttrWithMagic pgsAfter
+                                (AttrByName "*<-@")
+                                tgtObj
+                                key
+                                val
+                                noMagic
+                                exit
+      _ ->
+        throwEdh EvalError
+          $  "Invalid assignment target, it's a "
+          <> T.pack (show $ edhTypeOf tgtVal)
+          <> ": "
+          <> T.pack (show tgtVal)
 
 
 edhMakeCall
@@ -1477,38 +1558,37 @@ assignEdhTarget
   :: EdhProgState -> Expr -> EdhProcExit -> EdhValue -> EdhProg (STM ())
 assignEdhTarget !pgsAfter !lhExpr !exit !rhVal = do
   !pgs <- ask
-  let !callerCtx                    = edh'context pgs
-      !(Scope !ent !this !that _ _) = contextScope callerCtx
-      finishAssign :: Entity -> AttrKey -> STM ()
-      finishAssign !tgtEnt !key = do
-        modifyTVar' tgtEnt $ \em -> Map.insert key rhVal em
-        -- restore program state after assignment
-        runEdhProg pgsAfter $ exitEdhProc exit rhVal
   case lhExpr of
     AttrExpr !addr -> case addr of
+      -- silently drop value assigned to single underscore
       DirectRef (NamedAttr "_") ->
-        -- silently drop value assigned to single underscore
         contEdhSTM $ runEdhProg pgsAfter $ exitEdhProc exit nil
-      DirectRef !addr' ->
-        contEdhSTM $ resolveAddr pgs addr' >>= \key -> finishAssign ent key
-      IndirectRef !tgtExpr !addr' -> case tgtExpr of
-        AttrExpr ThisRef -> contEdhSTM $ resolveAddr pgs addr' >>= \key ->
-          finishAssign (objEntity this) key
-        AttrExpr ThatRef -> contEdhSTM $ resolveAddr pgs addr' >>= \key ->
-          finishAssign (objEntity that) key
-        AttrExpr SuperRef -> throwEdh EvalError "Can not assign via super"
-        _ -> evalExpr tgtExpr $ \OriginalValue {..} -> case valueFromOrigin of
-          EdhObject !tgtObj -> contEdhSTM $ resolveAddr pgs addr' >>= \key ->
-            finishAssign (objEntity tgtObj) key
-          _ ->
-            throwEdh EvalError
-              $  "Invalid assignment target, it's a "
-              <> T.pack (show $ edhTypeOf valueFromOrigin)
-              <> ": "
-              <> T.pack (show valueFromOrigin)
+      -- no magic imposed to direct assignment in a (possibly class) proc
+      DirectRef !addr' -> contEdhSTM $ resolveAddr pgs addr' >>= \key -> do
+        modifyTVar' (scopeEntity $ contextScope $ edh'context pgs)
+          $ Map.insert key rhVal
+        runEdhProg pgsAfter $ exitEdhProc exit rhVal
+      -- assign to an addressed attribute
+      IndirectRef !tgtExpr !addr' -> contEdhSTM $ do
+        key <- resolveAddr pgs addr'
+        runEdhProg pgs $ setEdhAttr pgsAfter tgtExpr key rhVal exit
+      -- god forbidden things
       ThisRef  -> throwEdh EvalError "Can not assign to this"
       ThatRef  -> throwEdh EvalError "Can not assign to that"
       SuperRef -> throwEdh EvalError "Can not assign to super"
+    -- dereferencing attribute assignment
+    InfixExpr "$" !tgtExpr !addrRef ->
+      evalExpr addrRef $ \(OriginalValue !addrVal _ _) -> case addrVal of
+        EdhString !attrName ->
+          setEdhAttr pgsAfter tgtExpr (AttrByName attrName) rhVal exit
+        EdhSymbol !sym ->
+          setEdhAttr pgsAfter tgtExpr (AttrBySym sym) rhVal exit
+        _ ->
+          throwEdh EvalError
+            $  "Invalid attribute reference - "
+            <> edhValueStr (edhTypeOf rhVal)
+            <> ": "
+            <> edhValueStr rhVal
     x ->
       throwEdh EvalError $ "Invalid left hand value for assignment: " <> T.pack
         (show x)
