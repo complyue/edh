@@ -1009,29 +1009,32 @@ getEdhAttrWithMagic
   -> EdhProg (STM ())
 getEdhAttrWithMagic !magicKey !obj !key !exitNoMagic !exit = do
   !pgs <- ask
+  let
+    getViaSupers :: [Object] -> EdhProg (STM ())
+    getViaSupers [] = exitNoMagic
+    getViaSupers (super : restSupers) =
+      getEdhAttrWithMagic (AttrByName "!<-") super magicKey noMetamagic
+        $ \(OriginalValue !magicMth _ _) ->
+            contEdhSTM $ withMagicMethod magicMth
+     where
+      noMetamagic :: EdhProg (STM ())
+      noMetamagic = contEdhSTM $ do
+        em <- readTVar (objEntity super)
+        case Map.lookup magicKey em of
+          Nothing        -> runEdhProg pgs $ getViaSupers restSupers
+          Just !magicMth -> withMagicMethod magicMth
+      withMagicMethod :: EdhValue -> STM ()
+      withMagicMethod !magicMth =
+        edhMakeCall pgs
+                    magicMth
+                    obj
+                    [SendPosArg (GodSendExpr $ attrKeyValue key)]
+          $ \mkCall ->
+              runEdhProg pgs $ mkCall $ \(OriginalValue !magicRtn _ _) ->
+                case magicRtn of
+                  EdhContinue -> getViaSupers restSupers
+                  _           -> exitEdhProc exit magicRtn
   contEdhSTM $ readTVar (objSupers obj) >>= runEdhProg pgs . getViaSupers
- where
-  getViaSupers :: [Object] -> EdhProg (STM ())
-  getViaSupers []                   = exitNoMagic
-  getViaSupers (super : restSupers) = do
-    !pgs <- ask
-    getEdhAttrWithMagic (AttrByName "!<-")
-                        super
-                        magicKey
-                        (getViaSupers restSupers)
-      $ \(OriginalValue !magicMth _ _) ->
-          contEdhSTM
-            $ edhMakeCall pgs
-                          magicMth
-                          obj
-                          [SendPosArg (GodSendExpr $ attrKeyValue key)]
-            $ \mkCall ->
-                runEdhProg pgs
-                  $ mkCall
-                  $ \magicResult@(OriginalValue !magicRtn _ _) ->
-                      case magicRtn of
-                        EdhContinue -> getViaSupers restSupers
-                        _           -> exit magicResult
 
 setEdhAttrWithMagic
   :: EdhProgState
